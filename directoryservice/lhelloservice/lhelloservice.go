@@ -15,11 +15,10 @@ import (
 	"log"
 	"strings"
 	"time"
-	//"math/rand"
 )
 
 type Service struct {
-	SID, Name, Address, Reply string
+	SID, Name, Address, Reply, Socket string
 }
 
 var mydescription Service
@@ -29,14 +28,14 @@ var allowedbinders string
 //  Initialize by setting address and registering service with directory service
 func init() {
 	allowedbinders = "tcp://*:5560"
-	mydescription = Service{"hello", "Hello Service", "tcp://localhost:5560", "hello"}
+	mydescription = Service{"hello", "Hello Service", "tcp://localhost:5560", "hello", "REP"}
 	//  All I need to know are the details of the lookup service
-	services["lookup"] = Service{"lookup", "LookUp Service", "tcp://localhost:5569", "lookup"}
+	services["lookup"] = Service{"lookup", "LookUp Service", "tcp://localhost:5569", "lookup", "REP"}
 
 	fmt.Println("Registering service...")
 	reply, err := sendRequest("lookup", "register", string(encodeTOJSON(mydescription)), 0, nil)
 	if err != nil {
-		panic(err)
+		log.Println(err)
 	}
 	fmt.Println("\t", reply)
 }
@@ -52,8 +51,14 @@ func main() {
 	responder.Bind(allowedbinders)
 
 	for {
+		var header []string
 		//  Wait for next request from client
-		msg, _ := responder.Recv(0)
+		msg, err := responder.Recv(0)
+		if err != nil {
+			header = append(header, "Error:Receive")
+			sendToClient("Error Receiving Message", mydescription.Reply, header, "Error Receiving message", 0, responder)
+			continue
+		}
 		fmt.Println("Received ", msg)
 
 		//  Do some 'work'
@@ -61,18 +66,26 @@ func main() {
 
 		//  Send reply back to client
 		reply := "World"
-		sendReply(reply, responder, 0)
+		header = append(header, "")
+		sendToClient(reply, mydescription.Reply, header, reply, 0, responder)
 	}
 }
 
-//  Send an encoded reply to service
-func sendReply(message string, responder *zmq.Socket, flags zmq.Flag) {
-	reply := mydescription.Reply + ":" + message
-	responder.Send(reply, flags)
+func sendToClient(message, myreplyheader string,
+	header []string, title string, more zmq.Flag, frontend *zmq.Socket) {
+
+	frontend.Send(myreplyheader, zmq.SNDMORE)
+	fmt.Println("\t", title)
+	for key := range header {
+		fmt.Printf("\tSending header to client: %s\n", header[key])
+		frontend.Send(header[key], zmq.SNDMORE)
+	}
+	fmt.Printf("\tSending message to client: %s\n", message)
+	frontend.Send(message, more)
 }
 
 //  Send a request to a service
-func sendRequest(SID, service, message string, flags zmq.Flag, requester *zmq.Socket) (reply string, err error) {
+func sendRequest(SID, service, message string, flags zmq.Flag, requester *zmq.Socket) (reply []string, err error) {
 	//  Bind to service if not already done
 	if requester == nil {
 		fmt.Println("Connecting to '", services[SID].Name, "'' at '", services[SID].Address, "'...")
@@ -86,25 +99,49 @@ func sendRequest(SID, service, message string, flags zmq.Flag, requester *zmq.So
 	}
 
 	//  Send message
-	msg := fmt.Sprintf("%s:%s", service, message)
-	requester.Send(msg, 0)
+	//  The service required in first packet of envelope
+	//  This implies that all odd packets in the message are the service identifiers
+	requester.Send(service, zmq.SNDMORE)
+	//  The message for given service in second packet of envelope
+	requester.Send(message, flags)
 	if flags != 0 {
 		return
 	}
 
 	//  Wait to receive reply if there are no more messages to send
-	prereply, _ := requester.Recv(0)
-	fmt.Println("\tReceived: ", prereply)
-	replies := strings.SplitN(prereply, ":", 2)
-	if len(replies) != 2 {
-		err = errors.New("Unexpected Reply")
+	//  Receive all replies in the envelope before processing
+	for count := 0; ; count++ {
+		var rep string
+		rep, err = requester.Recv(0)
+		reply = append(reply, rep)
+		if err != nil {
+			return
+		}
+		//  The first message in the envelope is the expected service signature
+		if count == 0 && reply[0] != services[SID].Reply {
+			err = errors.New("ServiceListOutdated:Bound to wrong service")
+			return
+		}
+		if count == 1 && strings.HasPrefix(reply[1], "Error") {
+			err = errors.New(reply[1])
+			return
+		}
+		//  Check if there are more in envelope otherwise break from loop
+		var more bool
+		more, err = requester.GetRcvmore()
+		if err != nil {
+			return
+		}
+		if !more {
+			break
+		}
+	}
+	fmt.Println("\tReceived: ", reply)
+	if len(reply) < 2 {
+		err = errors.New("UnexpectedReply")
 		return
 	}
-	if replies[0] != services[SID].Reply {
-		err = errors.New("ServiceListOutdated:Bound to wrong service")
-		return
-	}
-	reply = replies[1]
+	reply = reply[2:]
 	return
 }
 

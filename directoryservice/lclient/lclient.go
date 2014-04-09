@@ -22,7 +22,7 @@ import (
 var servicesReq []string
 
 type Service struct {
-	SID, Name, Address, Reply string
+	SID, Name, Address, Reply, Socket string
 }
 
 var services = make(map[string]Service)
@@ -33,7 +33,7 @@ func init() {
 	servicesFileName = "dcservicelist.json"
 	servicesReq = append(servicesReq, "hello")
 	//  All I need to know are the details of the lookup service
-	services["lookup"] = Service{"lookup", "LookUp Service", "tcp://localhost:5569", "lookup"}
+	services["lookup"] = Service{"lookup", "LookUp Service", "tcp://localhost:5569", "lookup", "REP"}
 
 	//  Get my service list
 	getServiceList()
@@ -41,13 +41,14 @@ func init() {
 	//  Get all services I require that are not listed in my service list
 	for _, serviceReq := range servicesReq {
 		if _, isListed := services[serviceReq]; isListed == false {
-			reply, err := sendRequest("lookup", "getservicedesc", serviceReq, 0, nil)
+			reply, err := sendRequest("lookup", "lookup", serviceReq, 0, nil)
 			if err != nil {
 				log.Println(err)
 				continue
 			}
-			registerService(reply,
-				serviceReq)
+			for i := range reply {
+				registerService(reply[i], serviceReq)
+			}
 		}
 	}
 }
@@ -75,7 +76,7 @@ func main() {
 }
 
 //  Send a request to a service
-func sendRequest(SID, service, message string, flags zmq.Flag, requester *zmq.Socket) (reply string, err error) {
+func sendRequest(SID, service, message string, flags zmq.Flag, requester *zmq.Socket) (reply []string, err error) {
 	//  Bind to service if not already done
 	if requester == nil {
 		fmt.Println("Connecting to '", services[SID].Name, "'' at '", services[SID].Address, "'...")
@@ -89,26 +90,49 @@ func sendRequest(SID, service, message string, flags zmq.Flag, requester *zmq.So
 	}
 
 	//  Send message
-	msg := fmt.Sprintf("%s:%s", service, message)
-	fmt.Println("\tSending: ", msg)
-	requester.Send(msg, flags)
+	//  The service required in first packet of envelope
+	//  This implies that all odd packets in the message are the service identifiers
+	requester.Send(service, zmq.SNDMORE)
+	//  The message for given service in second packet of envelope
+	requester.Send(message, flags)
 	if flags != 0 {
 		return
 	}
 
 	//  Wait to receive reply if there are no more messages to send
-	prereply, _ := requester.Recv(0)
-	fmt.Println("\tReceived: ", prereply)
-	replies := strings.SplitN(prereply, ":", 2)
-	if len(replies) != 2 {
-		err = errors.New("Unexpected Reply")
+	//  Receive all replies in the envelope before processing
+	for count := 0; ; count++ {
+		var rep string
+		rep, err = requester.Recv(0)
+		reply = append(reply, rep)
+		if err != nil {
+			return
+		}
+		//  The first message in the envelope is the expected service signature
+		if count == 0 && reply[0] != services[SID].Reply {
+			err = errors.New("ServiceListOutdated:Bound to wrong service")
+			return
+		}
+		if count == 1 && strings.HasPrefix(reply[1], "Error") {
+			err = errors.New(reply[1])
+			return
+		}
+		//  Check if there are more in envelope otherwise break from loop
+		var more bool
+		more, err = requester.GetRcvmore()
+		if err != nil {
+			return
+		}
+		if !more {
+			break
+		}
+	}
+	fmt.Println("\tReceived: ", reply)
+	if len(reply) < 2 {
+		err = errors.New("UnexpectedReply")
 		return
 	}
-	if replies[0] != services[SID].Reply {
-		err = errors.New("ServiceListOutdated:Bound to wrong service")
-		return
-	}
-	reply = replies[1]
+	reply = reply[2:]
 	return
 }
 

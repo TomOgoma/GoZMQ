@@ -13,27 +13,21 @@ import (
 )
 
 type Service struct {
-	SID, Name, Address, Reply, Socket string
+	SID, Name, Address, Reply string
 }
 
-//  Interface through which all client requests are to be processed
-type processRequest func(string) (string, error)
-
-//  Mapping of all services offered by broker service to their respective
-//  processRequest() functions as defined in the interface
-var myservices = make(map[string]processRequest)
-
-//  Mapping of all services to their descriptions (address, SID, reply header...)
 var services = make(map[string]Service)
-
-const allowedbinders = "tcp://*:5569"
-const servicesFileName = "dservices.json"
+var allowedbinders, servicesFileName string
+var mydescription Service
+var myservices = make(map[string]string)
 
 func init() {
-	myservices["lookup"] = getServiceDesc
-	myservices["register"] = registerService
-	services["lookup"] = Service{"lookup", "LooKUp Service", "tcp://localhost:5569", "lookup", "REP"}
-	services["register"] = Service{"register", "Registration Service", "tcp://localhost:5569", "lookup", "REP"}
+	mydescription = Service{"lookup", "LooKUp Service", "tcp://localhost:5569", "lookup"}
+	myservices["getservicedesc"] = "getservicedesc"
+	myservices["register"] = "register"
+	services["lookup"] = mydescription
+	allowedbinders = "tcp://*:5569"
+	servicesFileName = "dservices.json"
 
 	//  Load Service List
 	getServiceList()
@@ -56,16 +50,16 @@ func main() {
 	for {
 		//  Loop within a message envelope from a single client
 		fmt.Println("\nWaiting for next client...\n")
-		var serviceRequired processRequest
+		var serviceRequired string
 		for count := 0; ; count++ {
 			var request string
 			var header []string
+			header = append(header, mydescription.Reply)
 			request, err := responder.Recv(0)
 			fmt.Println("\tCurrent: ", request)
 			if err != nil {
 				log.Println(err)
-				header = append(header, "Error:Receive")
-				sendToClient("Error Receiving Message", services["lookup"].Reply, header, "Error Receiving message", 0, responder)
+				sendToClient("ErrorReceiving", header, "Error Retrieving message", 0, responder)
 				break
 			}
 			//  All messages where count is even in the envelope are
@@ -75,35 +69,35 @@ func main() {
 				var isPresent bool
 				serviceRequired, isPresent = myservices[request]
 				if !isPresent {
-					header = append(header, "Error:InvalidService")
-					sendToClient("Invalid Service Request", services["lookup"].Reply, header, "Invalid Service Request", 0, responder)
+					fmt.Printf("\nReceived request: %s\n", request)
+					sendToClient("InvalidRequest", header, "Invalid Service Request", 0, responder)
 					break
 				}
 				continue
 			}
-			//  Check if there are more in envelope and deal with any errors
-			more, err := responder.GetRcvmore()
-			if err != nil {
-				log.Println(err)
-				header = append(header, "Error:Receive")
-				sendToClient("Error Receiving Message", services["lookup"].Reply, header, "Error Receiving message", 0, responder)
-				break
-			}
-			//  Process the current message retrieved from the envelope
-			var reply string
-			errorstate := ""
-			reply, err = serviceRequired(request)
-			if err != nil {
-				log.Println(err)
-				errorstate = fmt.Sprintf("Error:%s", err)
-			}
-			//  If no more messages in envelope, then send all processed results
-			//  to the client otherwise keep processed message in header
-			if more {
-				header = append(header, errorstate, reply)
+			//  Check if there are more in envelope otherwise break from loop
+			if more, err := responder.GetRcvmore(); more {
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+				var reply string
+				reply, err = processRequest(serviceRequired, request)
+				if err != nil {
+					log.Println(err)
+				}
+				header = append(header, reply)
 			} else {
-				header = append(header, errorstate)
-				sendToClient(reply, services["lookup"].Reply, header, errorstate, 0, responder)
+				if err != nil {
+					break
+				}
+				var reply string
+				success := "success"
+				reply, err = processRequest(serviceRequired, request)
+				if err != nil {
+					success = fmt.Sprintf("%s", err)
+				}
+				sendToClient(reply, header, success, 0, responder)
 				fmt.Println("\tDone")
 				break
 			}
@@ -111,18 +105,35 @@ func main() {
 	}
 }
 
-func getServiceDesc(message string) (reply string, err error) {
-	//  Valid (Get Service Description) request
-	service, isPresent := services[message]
-	//  Service not available
-	if !isPresent {
-		err = errors.New("NotAvailable")
-		reply = "NotAvailable"
+func processRequest(serviceRequired, message string) (reply string, err error) {
+	//  Request to register a service
+	log.Println(serviceRequired)
+	if serviceRequired == "register" {
+		//  Valid (Register Service) request
+		err = registerService(message)
+		if err != nil {
+			reply = fmt.Sprintf("%s", err)
+			return
+		}
+		reply = "RegistrationSuccess"
+		return
+	} else if serviceRequired == "getservicedesc" {
+		//  Valid (Get Service Description) request
+		service, isPresent := services[message]
+		//  Service not available
+		if !isPresent {
+			err = errors.New("NotAvailable")
+			reply = "NotAvailable"
+			return
+		}
+		//  Service located
+		reply = string(encodeTOJSON(service))
+		return
+	} else {
+		err = errors.New("InternalError")
+		reply = "InternalError"
 		return
 	}
-	//  Service located
-	reply = string(encodeTOJSON(service))
-	return
 }
 
 // Populates the services map with mappings for available
@@ -148,9 +159,7 @@ func getServiceList() {
 			log.Println("Error decoding from json")
 			continue
 		}
-		if _, isPresent := services[service.SID]; !isPresent {
-			services[service.SID] = service
-		}
+		services[service.SID] = service
 		//read next line
 		line, err = reader.ReadBytes('\n')
 	}
@@ -162,9 +171,9 @@ func getServiceList() {
 // Lists all available services in the service list including the
 // "register" service that is not in the service list
 func listServices() {
-	fmt.Println("\n\n=====================\nAvailable services:\n{SID Name Address Reply Socket}")
+	fmt.Println("\n\n=====================\nAvailable services:\nSID\t\tName\t\t\tAddress")
 	for _, service := range services {
-		fmt.Println(service)
+		fmt.Println(service.SID, "\t\t", service.Name, "\t", service.Address)
 	}
 	fmt.Println("=====================\n")
 }
@@ -173,7 +182,7 @@ func listServices() {
 //  1. Decoding the JSON "register" message
 //  2. Adding the decoded service to the service list
 //  3. Encoding Entire service list to JSON and saving to file
-func registerService(message string) (reply string, err error) {
+func registerService(message string) (err error) {
 	var newservice Service
 	if len(services) == 0 {
 		services = make(map[string]Service)
@@ -185,7 +194,6 @@ func registerService(message string) (reply string, err error) {
 	if err != nil {
 		log.Println("Error decoding from JSON ", err)
 		err = errors.New(fmt.Sprintf("DecodeFail:%s", err))
-		reply = fmt.Sprintf("%s", err)
 		return
 	}
 
@@ -201,7 +209,6 @@ func registerService(message string) (reply string, err error) {
 		if err != nil {
 			log.Println("Error encoding ", value.SID, " to JSON")
 			err = errors.New(fmt.Sprintf("WriteFileFail:EncodeFail:%s", err))
-			reply = fmt.Sprintf("%s", err)
 			return
 		}
 		datab = append(datab, append(b, byte('\n'))...)
@@ -212,21 +219,16 @@ func registerService(message string) (reply string, err error) {
 	if err != nil {
 		log.Println("Error writing service list to file: ", err)
 		err = errors.New(fmt.Sprintf("WriteFileFail:%s", err))
-		reply = fmt.Sprintf("%s", err)
 		return
 	}
 
 	//  Updated service list
 	listServices()
-
-	reply = "RegistrationSuccess"
 	return
 }
 
-func sendToClient(message, myreplyheader string,
-	header []string, title string, more zmq.Flag, frontend *zmq.Socket) {
+func sendToClient(message string, header []string, title string, more zmq.Flag, frontend *zmq.Socket) {
 
-	frontend.Send(myreplyheader, zmq.SNDMORE)
 	fmt.Println("\t", title)
 	for key := range header {
 		fmt.Printf("\tSending header to client: %s\n", header[key])
