@@ -61,13 +61,13 @@ func main() {
 			var request string
 			var header []string
 			request, err := responder.Recv(0)
-			fmt.Println("\tCurrent: ", request)
 			if err != nil {
 				log.Println(err)
 				header = append(header, "Error:Receive")
 				sendToClient("Error Receiving Message", services["lookup"].Reply, header, "Error Receiving message", 0, responder)
 				break
 			}
+			fmt.Println("\tCurrent: ", request)
 			//  All messages where count is even in the envelope are
 			//  the expected service signature hence if the service is not
 			//  Present return an error
