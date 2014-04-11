@@ -135,9 +135,15 @@ func getServiceList() {
 // Lists all available services in the service list including the
 // "register" service that is not in the service list
 func listServices() {
+<<<<<<< HEAD
+	fmt.Printf("\n\n=====================\nAvailable services:\n%#v\n", msg.NewService("", "", "", "", ""))
+	for _, service := range services {
+		fmt.Printf("%v", service)
+=======
 	fmt.Println("\n\n=====================\nAvailable services:\n{SID Name Address Reply Socket}")
 	for _, service := range services {
 		fmt.Println(service)
+>>>>>>> a020ff35954a322911fb4e82d068d2114a174334
 	}
 	fmt.Println("=====================\n")
 }
