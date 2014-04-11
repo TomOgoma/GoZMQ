@@ -8,32 +8,30 @@ import (
 	zmq "github.com/pebbe/zmq4"
 	"io"
 	"io/ioutil"
+	msg "llibrary"
 	"log"
 	"os"
+	"time"
 )
 
-type Service struct {
-	SID, Name, Address, Reply, Socket string
-}
-
-//  Interface through which all client requests are to be processed
-type processRequest func(string) (string, error)
+//  Mapping of all services to their descriptions (address, SID, reply header...)
+var services = make(map[string]msg.Service)
 
 //  Mapping of all services offered by broker service to their respective
 //  processRequest() functions as defined in the interface
-var myservices = make(map[string]processRequest)
+var myservices = make(map[string]msg.ProcessRequest)
 
-//  Mapping of all services to their descriptions (address, SID, reply header...)
-var services = make(map[string]Service)
-
-const allowedbinders = "tcp://*:5569"
-const servicesFileName = "dservices.json"
+const (
+	ALLOWED_BINDERS   = "tcp://*:5569"
+	SERVICES_FILENAME = "dservices.json"
+)
 
 func init() {
 	myservices["lookup"] = getServiceDesc
 	myservices["register"] = registerService
-	services["lookup"] = Service{"lookup", "LooKUp Service", "tcp://localhost:5569", "lookup", "REP"}
-	services["register"] = Service{"register", "Registration Service", "tcp://localhost:5569", "lookup", "REP"}
+	myservices[msg.PPP_HEARTBEAT] = msg.ProcessHeartBeat
+	services["lookup"] = msg.NewService("lookup", "LooKUp Service", "tcp://localhost:5569", "lookup", "REP")
+	services["register"] = msg.NewService("register", "Registration Service", "tcp://localhost:5569", "lookup", "REP")
 
 	//  Load Service List
 	getServiceList()
@@ -49,77 +47,52 @@ func main() {
 		panic(err)
 	}
 	defer responder.Close()
-	responder.Bind(allowedbinders)
+	responder.Bind(ALLOWED_BINDERS)
 	fmt.Println("Directory Service at ", services["lookup"].Address, " waiting for connection...")
 
 	//  Wait for next request from client
 	for {
-		//  Loop within a message envelope from a single client
-		fmt.Println("\nWaiting for next client...\n")
-		var serviceRequired processRequest
-		for count := 0; ; count++ {
-			var request string
-			var header []string
-			request, err := responder.Recv(0)
-			if err != nil {
-				log.Println(err)
-				header = append(header, "Error:Receive")
-				sendToClient("Error Receiving Message", services["lookup"].Reply, header, "Error Receiving message", 0, responder)
-				break
-			}
-			fmt.Println("\tCurrent: ", request)
-			//  All messages where count is even in the envelope are
-			//  the expected service signature hence if the service is not
-			//  Present return an error
-			if count%2 == 0 {
-				var isPresent bool
-				serviceRequired, isPresent = myservices[request]
-				if !isPresent {
-					header = append(header, "Error:InvalidService")
-					sendToClient("Invalid Service Request", services["lookup"].Reply, header, "Invalid Service Request", 0, responder)
-					break
-				}
-				continue
-			}
-			//  Check if there are more in envelope and deal with any errors
-			more, err := responder.GetRcvmore()
-			if err != nil {
-				log.Println(err)
-				header = append(header, "Error:Receive")
-				sendToClient("Error Receiving Message", services["lookup"].Reply, header, "Error Receiving message", 0, responder)
-				break
-			}
-			//  Process the current message retrieved from the envelope
-			var reply string
-			errorstate := ""
-			reply, err = serviceRequired(request)
-			if err != nil {
-				log.Println(err)
-				errorstate = fmt.Sprintf("Error:%s", err)
-			}
-			//  If no more messages in envelope, then send all processed results
-			//  to the client otherwise keep processed message in header
-			if more {
-				header = append(header, errorstate, reply)
-			} else {
-				header = append(header, errorstate)
-				sendToClient(reply, services["lookup"].Reply, header, errorstate, 0, responder)
-				fmt.Println("\tDone")
-				break
-			}
+		var service_required msg.ProcessRequest
+		var message string
+		service_required, message, err = msg.RecieveClientRequest(responder, myservices)
+		var reply string
+		if err != nil {
+			msg.SendToClient(services["lookup"].Reply, fmt.Sprintf("%s", err), "Error Receiving Message", responder)
+			continue
 		}
+		reply, err := service_required(message)
+		if err != nil {
+			msg.SendToClient(services["lookup"].Reply, fmt.Sprintf("%s", err), "Error Processing Request", responder)
+			continue
+		}
+		msg.SendToClient(services["lookup"].Reply, "", reply, responder)
 	}
 }
 
-func getServiceDesc(message string) (reply string, err error) {
-	//  Valid (Get Service Description) request
-	service, isPresent := services[message]
+func getServiceDesc(SID string) (reply string, err error) {
+	//  Get description of requested service
+	service, isPresent := services[SID]
 	//  Service not available
 	if !isPresent {
 		err = errors.New("NotAvailable")
 		reply = "NotAvailable"
 		return
 	}
+
+	//  Get heartbeat of requested service
+	var heartbeat []string
+	heartbeat, err = msg.SendRequest(service, msg.PPP_HEARTBEAT, "")
+	heartbeat_state := time.Now().String()
+	if err != nil {
+		heartbeat_state = fmt.Sprintf("%s", err)
+	}
+	if len(heartbeat) < 1 || heartbeat[0] != msg.PPP_READY {
+		err = errors.New("Error:ServiceNotReady")
+		heartbeat_state = fmt.Sprintf("%s", err)
+	}
+	service.Heartbeat_state = heartbeat_state
+	services[SID] = service
+
 	//  Service located
 	reply = string(encodeTOJSON(service))
 	return
@@ -131,7 +104,7 @@ func getServiceDesc(message string) (reply string, err error) {
 func getServiceList() {
 
 	//read service list from file
-	filepointer, err := os.Open(servicesFileName)
+	filepointer, err := os.Open(SERVICES_FILENAME)
 	if err != nil {
 		log.Println(err)
 		return
@@ -140,7 +113,7 @@ func getServiceList() {
 	defer filepointer.Close()
 	reader := bufio.NewReader(filepointer)
 	line, err := reader.ReadBytes('\n')
-	var service Service
+	service := msg.NewService("", "", "", "", "")
 	for err == nil {
 		///*Decode from JSON
 		err = json.Unmarshal(line, &service)
@@ -174,9 +147,9 @@ func listServices() {
 //  2. Adding the decoded service to the service list
 //  3. Encoding Entire service list to JSON and saving to file
 func registerService(message string) (reply string, err error) {
-	var newservice Service
+	newservice := msg.NewService("", "", "", "", "")
 	if len(services) == 0 {
-		services = make(map[string]Service)
+		services = make(map[string]msg.Service)
 	}
 	fmt.Println("\n\tProcessing Service Registration Request for ", message, " ...")
 	//Decode Message
@@ -188,6 +161,9 @@ func registerService(message string) (reply string, err error) {
 		reply = fmt.Sprintf("%s", err)
 		return
 	}
+
+	//  Append latest heartbeat to the service description
+	newservice.Heartbeat_state = time.Now().String()
 
 	fmt.Println("\tRegistering...")
 	//Add to the active service list
@@ -208,7 +184,7 @@ func registerService(message string) (reply string, err error) {
 	}
 
 	//write to file
-	err = ioutil.WriteFile(servicesFileName, datab, os.ModePerm)
+	err = ioutil.WriteFile(SERVICES_FILENAME, datab, os.ModePerm)
 	if err != nil {
 		log.Println("Error writing service list to file: ", err)
 		err = errors.New(fmt.Sprintf("WriteFileFail:%s", err))
@@ -223,21 +199,8 @@ func registerService(message string) (reply string, err error) {
 	return
 }
 
-func sendToClient(message, myreplyheader string,
-	header []string, title string, more zmq.Flag, frontend *zmq.Socket) {
-
-	frontend.Send(myreplyheader, zmq.SNDMORE)
-	fmt.Println("\t", title)
-	for key := range header {
-		fmt.Printf("\tSending header to client: %s\n", header[key])
-		frontend.Send(header[key], zmq.SNDMORE)
-	}
-	fmt.Printf("\tSending message to client: %s\n", message)
-	frontend.Send(message, more)
-}
-
 //  Encode service struct to json
-func encodeTOJSON(service Service) []byte {
+func encodeTOJSON(service msg.Service) []byte {
 	//Encode to JSON
 	b, err := json.Marshal(service)
 	if err != nil {
